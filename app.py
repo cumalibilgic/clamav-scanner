@@ -2,44 +2,50 @@
 
 from __future__ import annotations
 
-import os
-import shutil
-import subprocess
+import queue
 import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from scanner import (
+    ACTION_SCAN,
+    ACTION_UPDATE,
+    CommandResult,
+    CommandRunner,
+    build_scan_command,
+    build_update_command,
+    can_start_scan,
+    default_quarantine_dir,
+    find_program,
+    summarize_exit_code,
+)
 
 APP_TITLE = "ClamAV Tarama Aracı"
+POLL_INTERVAL_MS = 100
 
 
 class ClamAVScanApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("700x520")
-        self.root.minsize(620, 450)
+        self.root.geometry("700x600")
+        self.root.minsize(620, 540)
         self.selected_path: Path | None = None
-        self.clamscan = tk.StringVar(value=self._find_program("clamscan.exe") or "")
-        self.freshclam = tk.StringVar(value=self._find_program("freshclam.exe") or "")
+        self.clamscan = tk.StringVar(value=find_program("clamscan.exe"))
+        self.freshclam = tk.StringVar(value=find_program("freshclam.exe"))
+        self.quarantine_enabled = tk.BooleanVar(value=False)
+        self.quarantine_dir = tk.StringVar(value=str(default_quarantine_dir()))
         self.status = tk.StringVar(value="Başlamak için ClamAV kurulumunu seçin veya bulunan yolu kontrol edin.")
         self._busy = False
+        self._runner = CommandRunner()
+        self._events: queue.Queue[tuple] = queue.Queue()
+        self._had_output = False
         self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(POLL_INTERVAL_MS, self._poll_events)
 
-    @staticmethod
-    def _find_program(name: str) -> str:
-        found = shutil.which(name)
-        if found:
-            return found
-        candidates = [
-            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "ClamAV" / name,
-            Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "ClamAV" / name,
-        ]
-        for candidate in candidates:
-            if candidate.is_file():
-                return str(candidate)
-        return ""
+    # ------------------------------------------------------------------ arayüz
 
     def _build_ui(self) -> None:
         outer = ttk.Frame(self.root, padding=20)
@@ -61,18 +67,39 @@ class ClamAVScanApp:
         self.path_text = tk.StringVar(value="Taranacak konum seçilmedi")
         ttk.Label(outer, textvariable=self.path_text, wraplength=640).pack(anchor="w", pady=(0, 10))
 
+        quarantine_row = ttk.Frame(outer)
+        quarantine_row.pack(fill="x", pady=(0, 10))
+        ttk.Checkbutton(
+            quarantine_row,
+            text="Tespit edilen dosyaları karantina klasörüne taşı",
+            variable=self.quarantine_enabled,
+        ).pack(side="left")
+        ttk.Entry(quarantine_row, textvariable=self.quarantine_dir).pack(side="left", fill="x", expand=True, padx=6)
+        ttk.Button(quarantine_row, text="Gözat", command=self._choose_quarantine_dir).pack(side="left")
+
         actions = ttk.Frame(outer)
         actions.pack(anchor="w")
         self.update_button = ttk.Button(actions, text="İmzaları güncelle", command=self._start_update)
         self.update_button.pack(side="left", padx=(0, 8))
         self.scan_button = ttk.Button(actions, text="Taramayı başlat", command=self._start_scan, state="disabled")
-        self.scan_button.pack(side="left")
+        self.scan_button.pack(side="left", padx=(0, 8))
+        self.cancel_button = ttk.Button(actions, text="İptal", command=self._cancel, state="disabled")
+        self.cancel_button.pack(side="left")
 
         ttk.Label(outer, textvariable=self.status, wraplength=640).pack(anchor="w", pady=(14, 6))
         result_frame = ttk.LabelFrame(outer, text="Tarama çıktısı", padding=6)
         result_frame.pack(fill="both", expand=True, pady=(4, 8))
-        self.output = tk.Text(result_frame, height=8, wrap="word", state="disabled")
-        self.output.pack(fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(result_frame, orient="vertical")
+        self.output = tk.Text(
+            result_frame,
+            height=8,
+            wrap="word",
+            state="disabled",
+            yscrollcommand=scrollbar.set,
+        )
+        scrollbar.configure(command=self.output.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.output.pack(side="left", fill="both", expand=True)
         ttk.Label(
             outer,
             text="Sınırlama: ClamAV tüm zararlıları tespit etmeyi garanti etmez. İmzalar güncel olmalıdır; bu araç gerçek zamanlı koruma sağlamaz.",
@@ -86,6 +113,8 @@ class ClamAVScanApp:
         ttk.Label(row, text=label, width=31).pack(side="left")
         ttk.Entry(row, textvariable=variable).pack(side="left", fill="x", expand=True, padx=6)
         ttk.Button(row, text="Gözat", command=lambda: self._choose_program(variable)).pack(side="left")
+
+    # ------------------------------------------------------------ seçim işlemleri
 
     def _choose_program(self, variable: tk.StringVar) -> None:
         chosen = filedialog.askopenfilename(
@@ -105,33 +134,61 @@ class ClamAVScanApp:
         if chosen:
             self._set_path(Path(chosen))
 
+    def _choose_quarantine_dir(self) -> None:
+        chosen = filedialog.askdirectory(title="Karantina klasörünü seçin")
+        if chosen:
+            self.quarantine_dir.set(chosen)
+
     def _set_path(self, path: Path) -> None:
         self.selected_path = path
         self.path_text.set(str(path))
-        self.scan_button.configure(state="normal")
+        self._refresh_buttons()
 
-    def _set_output(self, value: str) -> None:
-        self.output.configure(state="normal")
-        self.output.delete("1.0", "end")
-        self.output.insert("1.0", value or "Komut tamamlandı; ek çıktı yok.")
-        self.output.configure(state="disabled")
+    # ----------------------------------------------------------- düğme ve çıktı
+
+    def _refresh_buttons(self) -> None:
+        self.update_button.configure(state="disabled" if self._busy else "normal")
+        scan_allowed = can_start_scan(self.selected_path is not None, self._busy)
+        self.scan_button.configure(state="normal" if scan_allowed else "disabled")
+        self.cancel_button.configure(state="normal" if self._busy else "disabled")
 
     def _busy_state(self, busy: bool) -> None:
         self._busy = busy
-        self.update_button.configure(state="disabled" if busy else "normal")
-        can_scan = self.selected_path is not None and not busy
-        self.scan_button.configure(state="normal" if can_scan else "disabled")
+        self._refresh_buttons()
+
+    def _clear_output(self) -> None:
+        self._had_output = False
+        self.output.configure(state="normal")
+        self.output.delete("1.0", "end")
+        self.output.configure(state="disabled")
+
+    def _append_output(self, text: str) -> None:
+        if not text:
+            return
+        self._had_output = True
+        self.output.configure(state="normal")
+        self.output.insert("end", text)
+        self.output.see("end")
+        self.output.configure(state="disabled")
+
+    def _set_output(self, value: str) -> None:
+        self._clear_output()
+        self._append_output(value)
+
+    # ------------------------------------------------------------- komut akışı
 
     def _start_update(self) -> None:
+        if self._busy:
+            return
         executable = Path(self.freshclam.get().strip())
         if not executable.is_file():
             messagebox.showerror(APP_TITLE, "freshclam.exe bulunamadı. ClamAV kurulum klasöründen seçin.")
             return
-        self._busy_state(True)
-        self.status.set("ClamAV imza veritabanları güncelleniyor...")
-        threading.Thread(target=self._run_command, args=("update", [str(executable)]), daemon=True).start()
+        self._begin(ACTION_UPDATE, build_update_command(executable), "ClamAV imza veritabanları güncelleniyor...")
 
     def _start_scan(self) -> None:
+        if self._busy:
+            return
         if self.selected_path is None or not self.selected_path.exists():
             messagebox.showerror(APP_TITLE, "Lütfen mevcut bir dosya veya klasör seçin.")
             return
@@ -139,44 +196,76 @@ class ClamAVScanApp:
         if not executable.is_file():
             messagebox.showerror(APP_TITLE, "clamscan.exe bulunamadı. ClamAV kurulum klasöründen seçin.")
             return
+
+        quarantine: Path | None = None
+        if self.quarantine_enabled.get():
+            raw = self.quarantine_dir.get().strip()
+            if not raw:
+                messagebox.showerror(APP_TITLE, "Karantina klasörü boş. Bir klasör seçin veya karantinayı kapatın.")
+                return
+            quarantine = Path(raw)
+            try:
+                quarantine.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                messagebox.showerror(APP_TITLE, f"Karantina klasörü oluşturulamadı:\n{exc}")
+                return
+
+        args = build_scan_command(executable, self.selected_path, quarantine)
+        self._begin(ACTION_SCAN, args, "Tarama çalışıyor. Büyük klasörler uzun sürebilir...")
+
+    def _begin(self, action: str, args: list[str], message: str) -> None:
+        self._clear_output()
         self._busy_state(True)
-        self.status.set("Tarama çalışıyor. Büyük klasörler uzun sürebilir...")
-        args = [str(executable), "--recursive", "--infected", "--no-summary", str(self.selected_path)]
-        threading.Thread(target=self._run_command, args=("scan", args), daemon=True).start()
+        self.status.set(message)
+        threading.Thread(target=self._worker, args=(action, args), daemon=True).start()
 
-    def _run_command(self, action: str, args: list[str]) -> None:
+    def _worker(self, action: str, args: list[str]) -> None:
+        """Ayrı thread'de çalışır; arayüze yalnızca kuyruk üzerinden bilgi verir."""
         try:
-            result = subprocess.run(
-                args,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                check=False,
-            )
-            self.root.after(0, lambda: self._command_finished(action, result.returncode, result.stdout, result.stderr))
+            result = self._runner.run(args, lambda line: self._events.put(("line", line)))
         except OSError as exc:
-            detail = str(exc)
-            self.root.after(0, lambda: self._command_error(detail))
+            self._events.put(("error", str(exc)))
+            return
+        self._events.put(("done", action, result))
 
-    def _command_finished(self, action: str, code: int, stdout: str, stderr: str) -> None:
+    def _poll_events(self) -> None:
+        try:
+            while True:
+                event = self._events.get_nowait()
+                kind = event[0]
+                if kind == "line":
+                    self._append_output(event[1])
+                elif kind == "done":
+                    self._command_finished(event[1], event[2])
+                elif kind == "error":
+                    self._command_error(event[1])
+        except queue.Empty:
+            pass
+        self.root.after(POLL_INTERVAL_MS, self._poll_events)
+
+    def _cancel(self) -> None:
+        if self._busy:
+            self.cancel_button.configure(state="disabled")
+            self.status.set("İptal ediliyor...")
+            self._runner.cancel()
+
+    def _command_finished(self, action: str, result: CommandResult) -> None:
         self._busy_state(False)
-        output = "\n".join(part.strip() for part in (stdout, stderr) if part.strip())
-        self._set_output(output)
-        if action == "update":
-            self.status.set("İmza güncelleme tamamlandı." if code == 0 else f"İmza güncelleme başarısız oldu (kod {code}).")
-        elif code == 0:
-            self.status.set("ClamAV taramasında tespit edilen tehdit olmadı.")
-        elif code == 1:
-            self.status.set("ClamAV en az bir tehdit tespit etti. Ayrıntılar yukarıdaki çıktıda.")
-        else:
-            self.status.set(f"Tarama yapılamadı veya hata oluştu (kod {code}). Çıktıda hata ayrıntısı olabilir.")
+        if not self._had_output:
+            self._append_output("Komut tamamlandı; ek çıktı yok.")
+        self.status.set(summarize_exit_code(action, result.returncode, result.cancelled))
 
     def _command_error(self, detail: str) -> None:
         self._busy_state(False)
         self.status.set("ClamAV komutu çalıştırılamadı.")
         self._set_output(detail)
+
+    def _on_close(self) -> None:
+        if self._busy:
+            if not messagebox.askyesno(APP_TITLE, "Bir işlem sürüyor. İptal edip çıkmak istiyor musunuz?"):
+                return
+            self._runner.cancel()
+        self.root.destroy()
 
 
 def main() -> None:
